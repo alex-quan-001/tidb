@@ -97,6 +97,13 @@ const (
 	ActionCreateTables                  ActionType = 60
 	ActionMultiSchemaChange             ActionType = 61
 	ActionFlashbackCluster              ActionType = 62
+	ActionRecoverSchema                 ActionType = 63
+	ActionReorganizePartition           ActionType = 64
+	ActionAlterTTLInfo                  ActionType = 65
+	ActionAlterTTLRemove                ActionType = 67
+	ActionCreateResourceGroup           ActionType = 68
+	ActionAlterResourceGroup            ActionType = 69
+	ActionDropResourceGroup             ActionType = 70
 )
 
 var actionMap = map[ActionType]string{
@@ -158,6 +165,13 @@ var actionMap = map[ActionType]string{
 	ActionAlterTableStatsOptions:        "alter table statistics options",
 	ActionMultiSchemaChange:             "alter table multi-schema change",
 	ActionFlashbackCluster:              "flashback cluster",
+	ActionRecoverSchema:                 "flashback schema",
+	ActionReorganizePartition:           "alter table reorganize partition",
+	ActionAlterTTLInfo:                  "alter table ttl",
+	ActionAlterTTLRemove:                "alter table no_ttl",
+	ActionCreateResourceGroup:           "create resource group",
+	ActionAlterResourceGroup:            "alter resource group",
+	ActionDropResourceGroup:             "drop resource group",
 
 	// `ActionAlterTableAlterPartition` is removed and will never be used.
 	// Just left a tombstone here for compatibility.
@@ -223,6 +237,7 @@ type DDLReorgMeta struct {
 	WarningsCount map[errors.ErrorID]int64         `json:"warnings_count"`
 	Location      *TimeZoneLocation                `json:"location"`
 	ReorgTp       ReorgType                        `json:"reorg_tp"`
+	IsDistReorg   bool                             `json:"is_dist_reorg"`
 }
 
 // ReorgType indicates which process is used for the data reorganization.
@@ -250,6 +265,19 @@ const (
 // NeedMergeProcess means the incremental changes need to be merged.
 func (tp ReorgType) NeedMergeProcess() bool {
 	return tp == ReorgTypeLitMerge || tp == ReorgTypeTxnMerge
+}
+
+// String implements fmt.Stringer interface.
+func (tp ReorgType) String() string {
+	switch tp {
+	case ReorgTypeTxn:
+		return "txn"
+	case ReorgTypeLitMerge:
+		return "ingest"
+	case ReorgTypeTxnMerge:
+		return "txn-merge"
+	}
+	return ""
 }
 
 // TimeZoneLocation represents a single time zone.
@@ -296,8 +324,16 @@ type MultiSchemaInfo struct {
 	DropIndexes   []CIStr `json:"-"`
 	AlterIndexes  []CIStr `json:"-"`
 
+	AddForeignKeys []AddForeignKeyInfo `json:"-"`
+
 	RelativeColumns []CIStr `json:"-"`
 	PositionColumns []CIStr `json:"-"`
+}
+
+// AddForeignKeyInfo contains foreign key information.
+type AddForeignKeyInfo struct {
+	Name CIStr
+	Cols []CIStr
 }
 
 // NewMultiSchemaInfo new a MultiSchemaInfo.
@@ -321,6 +357,7 @@ type SubJob struct {
 	Warning     *terror.Error   `json:"warning"`
 	CtxVars     []interface{}   `json:"-"`
 	SchemaVer   int64           `json:"schema_version"`
+	ReorgTp     ReorgType       `json:"reorg_tp"`
 }
 
 // IsNormal returns true if the sub-job is normally running.
@@ -383,6 +420,49 @@ func (sub *SubJob) FromProxyJob(proxyJob *Job, ver int64) {
 	sub.Warning = proxyJob.Warning
 	sub.RowCount = proxyJob.RowCount
 	sub.SchemaVer = ver
+	sub.ReorgTp = proxyJob.ReorgMeta.ReorgTp
+}
+
+// JobMeta is meta info of Job.
+type JobMeta struct {
+	SchemaID int64 `json:"schema_id"`
+	TableID  int64 `json:"table_id"`
+	// Type is the DDL job's type.
+	Type ActionType `json:"job_type"`
+	// Query is the DDL job's SQL string.
+	Query string `json:"query"`
+	// Priority is only used to set the operation priority of adding indices.
+	Priority int `json:"priority"`
+}
+
+// BackfillMeta is meta info of the backfill job.
+type BackfillMeta struct {
+	IsUnique   bool          `json:"is_unique"`
+	EndInclude bool          `json:"end_include"`
+	Error      *terror.Error `json:"err"`
+
+	SQLMode       mysql.SQLMode                    `json:"sql_mode"`
+	Warnings      map[errors.ErrorID]*terror.Error `json:"warnings"`
+	WarningsCount map[errors.ErrorID]int64         `json:"warnings_count"`
+	Location      *TimeZoneLocation                `json:"location"`
+	ReorgTp       ReorgType                        `json:"reorg_tp"`
+	RowCount      int64                            `json:"row_count"`
+	StartKey      []byte                           `json:"start_key"`
+	EndKey        []byte                           `json:"end_key"`
+	CurrKey       []byte                           `json:"curr_key"`
+	*JobMeta      `json:"job_meta"`
+}
+
+// Encode encodes BackfillMeta with json format.
+func (bm *BackfillMeta) Encode() ([]byte, error) {
+	b, err := json.Marshal(bm)
+	return b, errors.Trace(err)
+}
+
+// Decode decodes BackfillMeta from the json buffer.
+func (bm *BackfillMeta) Decode(b []byte) error {
+	err := json.Unmarshal(b, bm)
+	return errors.Trace(err)
 }
 
 // Job is for a DDL operation.
@@ -520,13 +600,18 @@ func (job *Job) GetRowCount() int64 {
 
 // SetWarnings sets the warnings of rows handled.
 func (job *Job) SetWarnings(warnings map[errors.ErrorID]*terror.Error, warningsCount map[errors.ErrorID]int64) {
+	job.Mu.Lock()
 	job.ReorgMeta.Warnings = warnings
 	job.ReorgMeta.WarningsCount = warningsCount
+	job.Mu.Unlock()
 }
 
 // GetWarnings gets the warnings of the rows handled.
 func (job *Job) GetWarnings() (map[errors.ErrorID]*terror.Error, map[errors.ErrorID]int64) {
-	return job.ReorgMeta.Warnings, job.ReorgMeta.WarningsCount
+	job.Mu.Lock()
+	w, wc := job.ReorgMeta.Warnings, job.ReorgMeta.WarningsCount
+	job.Mu.Unlock()
+	return w, wc
 }
 
 // Encode encodes job with json format.
@@ -593,6 +678,10 @@ func (job *Job) String() string {
 	rowCount := job.GetRowCount()
 	ret := fmt.Sprintf("ID:%d, Type:%s, State:%s, SchemaState:%s, SchemaID:%d, TableID:%d, RowCount:%d, ArgLen:%d, start time: %v, Err:%v, ErrCount:%d, SnapshotVersion:%v",
 		job.ID, job.Type, job.State, job.SchemaState, job.SchemaID, job.TableID, rowCount, len(job.Args), TSConvert2Time(job.StartTS), job.Error, job.ErrorCount, job.SnapshotVer)
+	if job.ReorgMeta != nil {
+		warnings, _ := job.GetWarnings()
+		ret += fmt.Sprintf(", UniqueWarnings:%d", len(warnings))
+	}
 	if job.Type != ActionMultiSchemaChange && job.MultiSchemaInfo != nil {
 		ret += fmt.Sprintf(", Multi-Schema Change:true, Revertible:%v", job.MultiSchemaInfo.Revertible)
 	}
@@ -678,7 +767,12 @@ func (job *Job) hasDependentTableForExchangePartition(other *Job) (bool, error) 
 // How to check the job depends on "other"?
 // 1. The two jobs handle the same database when one of the two jobs is an ActionDropSchema or ActionCreateSchema type.
 // 2. Or the two jobs handle the same table.
+// 3. Or other job is flashback cluster.
 func (job *Job) IsDependentOn(other *Job) (bool, error) {
+	if other.Type == ActionFlashbackCluster {
+		return true, nil
+	}
+
 	isDependent, err := job.hasDependentSchema(other)
 	if err != nil || isDependent {
 		return isDependent, errors.Trace(err)
@@ -806,7 +900,8 @@ func (job *Job) IsRollbackable() bool {
 	case ActionMultiSchemaChange:
 		return job.MultiSchemaInfo.Revertible
 	case ActionFlashbackCluster:
-		if job.SchemaState == StateWriteReorganization {
+		if job.SchemaState == StateWriteReorganization ||
+			job.SchemaState == StateWriteOnly {
 			return false
 		}
 	}
@@ -860,6 +955,30 @@ func (s JobState) String() string {
 	}
 }
 
+// StrToJobState converts string to JobState.
+func StrToJobState(s string) JobState {
+	switch s {
+	case "running":
+		return JobStateRunning
+	case "rollingback":
+		return JobStateRollingback
+	case "rollback done":
+		return JobStateRollbackDone
+	case "done":
+		return JobStateDone
+	case "cancelled":
+		return JobStateCancelled
+	case "cancelling":
+		return JobStateCancelling
+	case "synced":
+		return JobStateSynced
+	case "queueing":
+		return JobStateQueueing
+	default:
+		return JobStateNone
+	}
+}
+
 // SchemaDiff contains the schema modification at a particular schema version.
 // It is used to reduce schema reload cost.
 type SchemaDiff struct {
@@ -872,6 +991,8 @@ type SchemaDiff struct {
 	OldTableID int64 `json:"old_table_id"`
 	// OldSchemaID is the schema ID before rename table, only used by rename table DDL.
 	OldSchemaID int64 `json:"old_schema_id"`
+	// RegenerateSchemaMap means whether to rebuild the schema map when applying to the schema diff.
+	RegenerateSchemaMap bool `json:"regenerate_schema_map"`
 
 	AffectedOpts []*AffectedOption `json:"affected_options"`
 }

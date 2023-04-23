@@ -87,7 +87,7 @@ type tableMetaMgr interface {
 	UpdateTableStatus(ctx context.Context, status metaStatus) error
 	UpdateTableBaseChecksum(ctx context.Context, checksum *verify.KVChecksum) error
 	CheckAndUpdateLocalChecksum(ctx context.Context, checksum *verify.KVChecksum, hasLocalDupes bool) (
-		needChecksum bool, needRemoteDupe bool, baseTotalChecksum *verify.KVChecksum, err error)
+		otherHasDupe bool, needRemoteDupe bool, baseTotalChecksum *verify.KVChecksum, err error)
 	FinishTable(ctx context.Context) error
 }
 
@@ -370,7 +370,7 @@ func (m *dbTableMetaMgr) UpdateTableStatus(ctx context.Context, status metaStatu
 }
 
 func (m *dbTableMetaMgr) CheckAndUpdateLocalChecksum(ctx context.Context, checksum *verify.KVChecksum, hasLocalDupes bool) (
-	needChecksum bool, needRemoteDupe bool, baseTotalChecksum *verify.KVChecksum, err error,
+	otherHasDupe bool, needRemoteDupe bool, baseTotalChecksum *verify.KVChecksum, err error,
 ) {
 	conn, err := m.session.Conn(ctx)
 	if err != nil {
@@ -393,7 +393,7 @@ func (m *dbTableMetaMgr) CheckAndUpdateLocalChecksum(ctx context.Context, checks
 		taskHasDuplicates                          bool
 	)
 	newStatus := metaStatusChecksuming
-	needChecksum = true
+	otherHasDupe = false
 	needRemoteDupe = true
 	err = exec.Transact(ctx, "checksum pre-check", func(ctx context.Context, tx *sql.Tx) error {
 		rows, err := tx.QueryContext(
@@ -423,9 +423,7 @@ func (m *dbTableMetaMgr) CheckAndUpdateLocalChecksum(ctx context.Context, checks
 				return err
 			}
 
-			if taskHasDuplicates {
-				needChecksum = false
-			}
+			otherHasDupe = otherHasDupe || taskHasDuplicates
 
 			// skip finished meta
 			if status >= metaStatusFinished {
@@ -436,7 +434,6 @@ func (m *dbTableMetaMgr) CheckAndUpdateLocalChecksum(ctx context.Context, checks
 				if status >= metaStatusChecksuming {
 					newStatus = status
 					needRemoteDupe = status == metaStatusChecksuming
-					needChecksum = needChecksum && needRemoteDupe
 					return nil
 				}
 
@@ -445,7 +442,6 @@ func (m *dbTableMetaMgr) CheckAndUpdateLocalChecksum(ctx context.Context, checks
 
 			if status < metaStatusChecksuming {
 				newStatus = metaStatusChecksumSkipped
-				needChecksum = false
 				needRemoteDupe = false
 				break
 			} else if status == metaStatusChecksuming {
@@ -475,12 +471,13 @@ func (m *dbTableMetaMgr) CheckAndUpdateLocalChecksum(ctx context.Context, checks
 		return false, false, nil, err
 	}
 
-	if needChecksum {
+	if !otherHasDupe && needRemoteDupe {
 		ck := verify.MakeKVChecksum(totalBytes, totalKvs, totalChecksum)
 		baseTotalChecksum = &ck
 	}
 	log.FromContext(ctx).Info("check table checksum", zap.String("table", m.tr.tableName),
-		zap.Bool("checksum", needChecksum), zap.String("new_status", newStatus.String()))
+		zap.Bool("otherHasDupe", otherHasDupe), zap.Bool("needRemoteDupe", needRemoteDupe),
+		zap.String("new_status", newStatus.String()))
 	return
 }
 
@@ -1073,7 +1070,7 @@ func (m noopTableMetaMgr) UpdateTableBaseChecksum(ctx context.Context, checksum 
 }
 
 func (m noopTableMetaMgr) CheckAndUpdateLocalChecksum(ctx context.Context, checksum *verify.KVChecksum, hasLocalDupes bool) (bool, bool, *verify.KVChecksum, error) {
-	return true, true, &verify.KVChecksum{}, nil
+	return false, true, &verify.KVChecksum{}, nil
 }
 
 func (m noopTableMetaMgr) FinishTable(ctx context.Context) error {
@@ -1186,9 +1183,12 @@ func getGlobalAutoIDAlloc(store kv.Storage, dbID int64, tblInfo *model.TableInfo
 		return nil, errors.New("internal error: dbID should not be 0")
 	}
 
-	// We don't need the cache here because we allocate all IDs at once.
-	// The argument for CustomAutoIncCacheOption is the cache step. step 1 means no cache.
-	noCache := autoid.CustomAutoIncCacheOption(1)
+	// We don't need autoid cache here because we allocate all IDs at once.
+	// The argument for CustomAutoIncCacheOption is the cache step. Step 1 means no cache,
+	// but step 1 will enable an experimental feature, so we use step 2 here.
+	//
+	// See https://github.com/pingcap/tidb/issues/38442 for more details.
+	noCache := autoid.CustomAutoIncCacheOption(2)
 	tblVer := autoid.AllocOptionTableInfoVersion(tblInfo.Version)
 
 	hasRowID := common.TableHasAutoRowID(tblInfo)

@@ -55,7 +55,7 @@ type delRangeManager interface {
 	addDelRangeJob(ctx context.Context, job *model.Job) error
 	// removeFromGCDeleteRange removes the deleting table job from gc_delete_range table by jobID and tableID.
 	// It's use for recover the table that was mistakenly deleted.
-	removeFromGCDeleteRange(ctx context.Context, jobID int64, tableID []int64) error
+	removeFromGCDeleteRange(ctx context.Context, jobID int64) error
 	start()
 	clear()
 }
@@ -125,13 +125,13 @@ func insertJobIntoDeleteRangeTableMultiSchema(ctx context.Context, sctx sessionc
 }
 
 // removeFromGCDeleteRange implements delRangeManager interface.
-func (dr *delRange) removeFromGCDeleteRange(ctx context.Context, jobID int64, tableIDs []int64) error {
+func (dr *delRange) removeFromGCDeleteRange(ctx context.Context, jobID int64) error {
 	sctx, err := dr.sessPool.get()
 	if err != nil {
 		return errors.Trace(err)
 	}
 	defer dr.sessPool.put(sctx)
-	err = util.RemoveMultiFromGCDeleteRange(ctx, sctx, jobID, tableIDs)
+	err = util.RemoveMultiFromGCDeleteRange(ctx, sctx, jobID)
 	return errors.Trace(err)
 }
 
@@ -266,7 +266,7 @@ func insertJobIntoDeleteRangeTable(ctx context.Context, sctx sessionctx.Context,
 		return errors.Trace(err)
 	}
 
-	ctx = kv.WithInternalSourceType(ctx, getDDLRequestSource(job))
+	ctx = kv.WithInternalSourceType(ctx, getDDLRequestSource(job.Type))
 	s := sctx.(sqlexec.SQLExecutor)
 	switch job.Type {
 	case model.ActionDropSchema:

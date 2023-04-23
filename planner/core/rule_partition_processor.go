@@ -136,7 +136,7 @@ func (s *partitionProcessor) findUsedPartitions(ctx sessionctx.Context, tbl tabl
 		partIdx[i].Index = i
 		colLen = append(colLen, types.UnspecifiedLength)
 	}
-	detachedResult, err := ranger.DetachCondAndBuildRangeForPartition(ctx, conds, partIdx, colLen)
+	detachedResult, err := ranger.DetachCondAndBuildRangeForPartition(ctx, conds, partIdx, colLen, ctx.GetSessionVars().RangeMaxSize)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -288,7 +288,8 @@ func (s *partitionProcessor) pruneHashPartition(ctx sessionctx.Context, tbl tabl
 // please see https://github.com/pingcap/tidb/issues/22635 for more details.
 func (s *partitionProcessor) reconstructTableColNames(ds *DataSource) ([]*types.FieldName, error) {
 	names := make([]*types.FieldName, 0, len(ds.TblCols))
-	colsInfo := ds.table.FullHiddenColsAndVisibleCols()
+	// Use DeletableCols to get all the columns.
+	colsInfo := ds.table.DeletableCols()
 	colsInfoMap := make(map[int64]*table.Column, len(colsInfo))
 	for _, c := range colsInfo {
 		colsInfoMap[c.ID] = c
@@ -531,7 +532,7 @@ func (l *listPartitionPruner) detachCondAndBuildRange(conds []expression.Express
 		colLen = append(colLen, types.UnspecifiedLength)
 	}
 
-	detachedResult, err := ranger.DetachCondAndBuildRangeForPartition(l.ctx, conds, cols, colLen)
+	detachedResult, err := ranger.DetachCondAndBuildRangeForPartition(l.ctx, conds, cols, colLen, l.ctx.GetSessionVars().RangeMaxSize)
 	if err != nil {
 		return nil, err
 	}
@@ -1043,7 +1044,7 @@ func multiColumnRangeColumnsPruner(sctx sessionctx.Context, exprs []expression.E
 		lens = append(lens, columnsPruner.partCols[i].RetType.GetFlen())
 	}
 
-	res, err := ranger.DetachCondAndBuildRangeForIndex(sctx, exprs, columnsPruner.partCols, lens)
+	res, err := ranger.DetachCondAndBuildRangeForIndex(sctx, exprs, columnsPruner.partCols, lens, sctx.GetSessionVars().RangeMaxSize)
 	if err != nil {
 		return fullRange(len(columnsPruner.lessThan))
 	}
@@ -1227,13 +1228,9 @@ func partitionRangeForInExpr(sctx sessionctx.Context, args []expression.Expressi
 		if !ok {
 			return pruner.fullRange()
 		}
-		switch constExpr.Value.Kind() {
-		case types.KindInt64, types.KindUint64:
-		case types.KindNull:
+		if constExpr.Value.Kind() == types.KindNull {
 			result = append(result, partitionRange{0, 1})
 			continue
-		default:
-			return pruner.fullRange()
 		}
 
 		var val int64
