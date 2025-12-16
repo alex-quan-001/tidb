@@ -292,7 +292,23 @@ func balanceBatchCopTaskWithContinuity(storeTaskMap map[uint64]*batchCopTask, ca
 // The first balance strategy: use a greedy algorithm to put it into the store with highest weight. This strategy only consider the region count between TiFlash stores.
 //
 // The second balance strategy: Not only consider the region count between TiFlash stores, but also try to make the regions' range continuous(stored in TiFlash closely).
-// If balanceWithContinuity is true, the second balance strategy is enable.
+// balanceBatchCopTask balances region assignments among stores for a set of batch cop tasks,
+// optionally preserving contiguous region ranges when requested.
+//
+// balanceBatchCopTask returns a new slice of batchCopTask with regionInfos redistributed
+// across available stores to achieve a more even per-store region count. When running in MPP
+// mode the function probes TiFlash stores for availability and skips unavailable ones; when
+// not in MPP mode it uses the original task-to-store mapping as the initial assignment.
+// If balanceWithContinuity is true the function first attempts a continuity-aware balancing
+// strategy and uses it when the resulting balance score is acceptable.
+//
+// The function falls back to returning the originalTasks in these cases:
+//  - originalTasks is empty, or contains one task and not in MPP mode,
+//  - a region has no available store for assignment,
+//  - duplicated region information is detected,
+//  - the balancing algorithm cannot assign all regions.
+//
+// The returned slice contains only tasks with non-empty regionInfos.
 func balanceBatchCopTask(ctx context.Context, kvStore *kvStore, originalTasks []*batchCopTask, mppStoreLastFailTime *sync.Map, ttl time.Duration, balanceWithContinuity bool, balanceContinuousRegionCount int64) []*batchCopTask {
 	if len(originalTasks) == 0 {
 		log.Info("Batch cop task balancer got an empty task set.")
